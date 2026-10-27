@@ -1,5 +1,6 @@
 """HQ Study job on a GitHub runner. Job: /tmp/job.json -> /tmp/out/result.json (+ data.json).
-actions: subs (title search on OpenSubtitles, or an uploaded subtitle file ref) | yt_search (YouTube search, metadata only)."""
+actions: subs (title search on OpenSubtitles, or an uploaded subtitle file ref) | yt_search (YouTube search, metadata only) | yt_captions (one video's captions)
+| lrc (song lyrics + YouTube candidates) | gutenberg (public-domain book chapters) | tts (English voice note -> files/voice.ogg)."""
 import gzip, io, json, os, re, subprocess, urllib.parse, urllib.request, zipfile
 OUT = "/tmp/out"; os.makedirs(OUT, exist_ok=True)
 job = json.load(open("/tmp/job.json"))
@@ -155,8 +156,109 @@ def notebook():
     wb = _writeback(ck, path)
     if not (text or "").strip(): done(False, error="Gemini Notebook returned an empty answer.", session=wb)
     done(True, {"text": text.strip()}, session=wb)
+def yt_captions():   # SDD-005 M01: captions of one YouTube video -> timestamped plain transcript (no download)
+    import glob
+    Y = os.path.expanduser("~/.local/bin/yt-dlp"); d = "/tmp/ytc"; os.makedirs(d, exist_ok=True)
+    p = subprocess.run([Y, "--skip-download", "--write-subs", "--write-auto-subs", "--sub-langs", "en.*,en,fa,fa-orig", "--sub-format", "vtt",
+                        "-o", d + "/v.%(ext)s", "--print-json", "--no-warnings", job["url"]], capture_output=True, text=True, timeout=240)
+    meta = {}
+    for l in reversed((p.stdout or "").strip().splitlines()):
+        try: meta = json.loads(l); break
+        except Exception: pass
+    fs = glob.glob(d + "/*.vtt")
+    if not fs: done(False, error="No captions: " + ((p.stderr or "").strip().splitlines() or ["none"])[-1][:200])
+    def rank(f):
+        n = os.path.basename(f); auto = bool(meta.get("automatic_captions")) and n.split(".")[-2] in (meta.get("automatic_captions") or {}) and n.split(".")[-2] not in (meta.get("subtitles") or {})
+        return (0 if ".en" in n else 1, 1 if auto else 0, len(n))
+    f = sorted(fs, key=rank)[0]; out, last, mark = [], "", -999
+    for blk in open(f, encoding="utf-8", errors="replace").read().split("\n\n"):
+        m = re.search(r"(\d+):(\d\d):(\d\d)\.\d+\s+-->", blk) or re.search(r"(?:^|\n)()(\d\d):(\d\d)\.\d+\s+-->", blk)
+        if not m: continue
+        sec = int(m.group(1) or 0) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+        txt = " ".join(re.sub(r"<[^>]+>", "", l).strip() for l in blk.split("\n") if "-->" not in l and not l.startswith(("WEBVTT", "Kind:", "Language:", "NOTE")) and l.strip())
+        txt = re.sub(r"\s+", " ", txt).strip()
+        if not txt or txt == last or (last and txt in last): continue
+        if last and txt.startswith(last): txt = txt[len(last):].strip()
+        last = txt if not out or txt not in out[-1] else last
+        if sec - mark >= 30: out.append(f"\n[{sec // 60}:{sec % 60:02d}] "); mark = sec
+        out.append(txt + " ")
+    text = re.sub(r"[ ]{2,}", " ", "".join(out)).strip()
+    if len(text) < 200: done(False, error="Captions were empty.")
+    done(True, {"title": meta.get("title"), "channel": meta.get("channel") or meta.get("uploader"), "duration": meta.get("duration"), "lang": os.path.basename(f).split(".")[-2], "text": text[:120000]}, count=len(text))
+
+# ---------- owner 2026-10-27: Music / Book English lookups and voice notes run here, not on the 2 GB server ----------
+UA = {"User-Agent": "LeadDesk-HQ/1.0 (personal English study)"}
+BADV = re.compile(r"\b(live|cover|remix|karaoke|instrumental|acoustic|sped up|slowed|nightcore|8d)\b", re.I)
+def _yts(q, n=4):
+    Y = os.path.expanduser("~/.local/bin/yt-dlp")
+    try:
+        p = subprocess.run([Y, "--flat-playlist", "-J", f"ytsearch{n}:{q}"], capture_output=True, text=True, timeout=90)
+        return [{"id": e["id"], "title": e.get("title"), "channel": e.get("channel") or e.get("uploader"), "duration": e.get("duration")}
+                for e in (json.loads(p.stdout).get("entries") or []) if e.get("id") and "/shorts/" not in str(e.get("url"))]
+    except Exception: return []
+def lrc():   # song lyrics (lrclib.net, synced when possible) + YouTube candidates for the audio, music video and lyric video
+    title, artist, q = (job.get("title") or "").strip(), (job.get("artist") or "").strip(), (job.get("q") or "").strip()
+    rs = []
+    if title and artist:
+        try: rs = json.loads(fetch("https://lrclib.net/api/search?" + urllib.parse.urlencode({"track_name": title, "artist_name": artist}), UA, 30))
+        except Exception: rs = []
+    if not rs:
+        try: rs = json.loads(fetch("https://lrclib.net/api/search?" + urllib.parse.urlencode({"q": q or f"{artist} {title}"}), UA, 30))
+        except Exception as e: done(False, error=f"lyrics search failed ({type(e).__name__})")
+    want_bad = bool(BADV.search(q + " " + title))
+    rs = [r for r in rs if (r.get("plainLyrics") or r.get("syncedLyrics")) and not r.get("instrumental")]
+    rs.sort(key=lambda r: ((bool(BADV.search(f"{r.get('trackName', '')} {r.get('albumName') or ''}")) and not want_bad), " - " in (r.get("trackName") or ""), not r.get("syncedLyrics")))
+    if not rs: done(False, error="No lyrics were found for that song.")
+    b = {k: rs[0].get(k) for k in ("id", "trackName", "artistName", "albumName", "duration", "plainLyrics", "syncedLyrics")}
+    a, t = b["artistName"] or artist, b["trackName"] or title
+    yt = {"audio": _yts(f"{a} {t} official audio"), "video": _yts(f"{a} {t} official music video"), "lyric": _yts(f"{a} {t} lyrics")} if job.get("yt", True) else {}
+    done(True, {"lrc": b, "yt": yt}, title=t)
+def gutenberg():   # a public-domain book from Project Gutenberg, split into chapters
+    title, author = (job.get("title") or "").strip(), (job.get("author") or "").strip()
+    q = f"{title} {author.split()[-1] if author else ''}".strip()
+    j = json.loads(fetch("https://gutendex.com/books/?" + urllib.parse.urlencode({"search": q, "languages": "en"}), UA, 60))
+    key = title.lower().split(":")[0].strip(); best = None
+    for bk in j.get("results") or []:
+        if key and key in (bk.get("title") or "").lower():
+            f = bk.get("formats") or {}; u = next((v for m, v in f.items() if m.startswith("text/plain")), None)
+            if u: best = (bk, u); break
+    if not best: done(False, error="This book is not in Project Gutenberg (not public domain).")
+    bk, u = best; raw = fetch(u, UA, 120).decode("utf-8", "ignore")
+    s0 = raw.find("*** START"); e0 = raw.find("*** END"); body = raw[raw.find("\n", s0) + 1 if s0 >= 0 else 0: e0 if e0 > 0 else len(raw)]
+    heads = list(re.finditer(r"^\s*((?:CHAPTER|Chapter|BOOK|Book|PART|Part|LETTER|Letter|STAVE|Stave)\s+[IVXLCDM\d]+[^\n]{0,80}|[IVXLC]+\.\s[^\n]{0,60})\s*$", body, re.M))
+    chs = []
+    for i, m in enumerate(heads):
+        txt = body[m.end(): heads[i + 1].start() if i + 1 < len(heads) else len(body)].strip()
+        if len(txt) > 800: chs.append({"name": m.group(1).strip()[:80], "text": txt[:60000]})
+    if not chs: chs = [{"name": f"Section {i + 1}", "text": body[k:k + 15000]} for i, k in enumerate(range(0, min(len(body), 450000), 15000))]
+    done(True, {"id": bk["id"], "title": bk.get("title"), "url": f"https://www.gutenberg.org/ebooks/{bk['id']}", "chapters": chs[:80]}, count=len(chs))
+def tts():   # English voice note: edge-tts in parallel chunks -> one mono ogg/opus file in files/voice.ogg
+    import asyncio, sys, site, importlib
+    import shutil
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--user", "edge-tts"] + ([] if shutil.which("ffmpeg") else ["imageio-ffmpeg"]), capture_output=True, timeout=240)
+    importlib.invalidate_caches(); sys.path.append(site.getusersitepackages()); import edge_tts
+    ff = shutil.which("ffmpeg")
+    if not ff: import imageio_ffmpeg; ff = imageio_ffmpeg.get_ffmpeg_exe()   # the runner image has no ffmpeg; this is a static build with libopus
+    text, voice, rate = str(job.get("text") or "")[:6000], job.get("voice") or "en-US-AndrewNeural", job.get("rate") or "-5%"
+    ch, cur = [], ""
+    for line in text.split("\n"):
+        if cur and len(cur) + len(line) > 600: ch.append(cur); cur = ""
+        cur += line + "\n"
+    if cur.strip(): ch.append(cur)
+    if not ch: done(False, error="empty text")
+    parts = [f"/tmp/vo_{i}.mp3" for i in range(len(ch))]
+    async def go():
+        sem = asyncio.Semaphore(4)
+        async def one(t, f):
+            async with sem: await edge_tts.Communicate(t, voice, rate=rate).save(f)
+        await asyncio.gather(*(one(t, f) for t, f in zip(ch, parts)))
+    asyncio.run(go())
+    open("/tmp/vo.txt", "w").write("".join(f"file '{f}'\n" for f in parts)); os.makedirs(OUT + "/files", exist_ok=True)
+    subprocess.run([ff, "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", "/tmp/vo.txt", "-ac", "1", "-c:a", "libopus", "-b:a", "24k", "-application", "voip", OUT + "/files/voice.ogg"], check=True, timeout=300)
+    done(True, {"path": f"jobs/{os.environ.get('CID', '')}/files/voice.ogg", "bytes": os.path.getsize(OUT + "/files/voice.ogg")})
+
 try:
-    {"subs": subs, "yt_search": yt_search, "notebook": notebook}[job.get("action")]()
+    {"subs": subs, "yt_search": yt_search, "notebook": notebook, "yt_captions": yt_captions, "lrc": lrc, "gutenberg": gutenberg, "tts": tts}[job.get("action")]()
 except SystemExit: raise
 except Exception as e:
     done(False, error=f"{type(e).__name__}: {str(e)[:200]}")
